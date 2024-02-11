@@ -1,98 +1,94 @@
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Embedding, LSTM, Dense, Concatenate, Input
-from tensorflow.keras import Model
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Embedding, LSTM, Dense
 import numpy as np
 
-# CSV 파일 로드
-df = pd.read_csv('csv/persona/2.csv')
+# 1. 데이터 불러오기
+file_path = 'csv/persona/1.tsv'
+df = pd.read_csv(file_path, delimiter='\t')
 
-# 데이터 전처리
-tokenizer = Tokenizer()
-tokenizer.fit_on_texts(df['utterance_text'])
-total_words = len(tokenizer.word_index) + 1
+# 2. 데이터 분할
+train_data, val_data = train_test_split(df, test_size=0.2, random_state=42)
 
-# 텍스트 데이터를 토큰화하여 시퀀스로 변환
-input_sequences = tokenizer.texts_to_sequences(df['utterance_text'])
-input_sequences = pad_sequences(input_sequences, padding='post')
+# 3. 토큰화 및 모델 구성
+tokenizers = {}
+train_padded = {}
+val_padded = {}
+models = {}
 
-# Label을 만들 때에는 다음 문장을 사용
-labels = tokenizer.texts_to_sequences(df['utterance_text'].apply(lambda x: " ".join(x.split()[1:])))
-labels = pad_sequences(labels, padding='post')
+# 문체 종류 추가
+styles = ['formal', 'informal', 'android', 'azae', 'chat', 'choding', 'emoticon', 'enfp', 'gentle', 'halbae',
+          'halmae', 'joongding', 'king', 'naruto', 'seonbi', 'sosim', 'translator']
 
+for column in styles:
+    # NaN 값을 실제 NaN 값으로 대체
+    train_data[column] = train_data[column].astype(str).replace('nan', np.nan).fillna('NaN').copy()
+    val_data[column] = val_data[column].astype(str).replace('nan', np.nan).fillna('NaN').copy()
 
-# profile_gender와 profile_age를 숫자로 매핑
-gender_mapping = {'N/A': 0, '여성': 1, '남성': 2}
-age_mapping = {'20대': 1, '30대': 2, '40대': 3, '50대': 4, '60대 이상': 5}
+    # 각 문체에 대한 토큰화
+    tokenizer = Tokenizer(oov_token="<OOV>")
+    tokenizer.fit_on_texts(pd.concat([train_data[column], val_data[column]]))
 
-df['profile_gender'] = df['profile_gender'].map(gender_mapping)
-df['profile_age'] = df['profile_age'].map(age_mapping)
+    train_sequences = tokenizer.texts_to_sequences(train_data[column])
+    val_sequences = tokenizer.texts_to_sequences(val_data[column])
 
-# 입력 데이터와 레이블 생성
-X = np.column_stack((df['profile_gender'], df['profile_age']))  # 데이터를 수평으로 쌓음
-y = np.argmax(labels, axis=-1)
+    train_padded[column] = pad_sequences(train_sequences)
+    val_padded[column] = pad_sequences(val_sequences)
 
-# 모델 구축
-embedding_dim = 100
+    tokenizers[column] = tokenizer
 
-input_layer = Input(shape=(input_sequences.shape[1],))
-embedding_layer = Embedding(input_dim=total_words, output_dim=embedding_dim, input_length=input_sequences.shape[1])(input_layer)
-lstm_layer = LSTM(100)(embedding_layer)
-output_layer = Dense(total_words, activation='softmax')(lstm_layer)
+    # 모델 구성
+    model = Sequential()
+    model.add(Embedding(input_dim=len(tokenizers[column].word_index) + 1, output_dim=64,
+                        input_length=train_padded[column].shape[1]))
+    model.add(LSTM(128))
+    model.add(Dense(1, activation='sigmoid'))
 
-model = Model(inputs=input_layer, outputs=output_layer)
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
-# 모델 훈련
-model.fit(input_sequences, y, epochs=10, validation_split=0.2)  # validation_data 대신 validation_split 사용
+    models[column] = model
 
-# 가장 성능이 좋은 모델 저장
-model.save('best_model.h5')
+# 4. 모델 학습
+for column in styles:
+    # 'NaN' 값을 제외하고 정수로 변환
+    train_data[column] = pd.to_numeric(train_data[column], errors='coerce')
+    val_data[column] = pd.to_numeric(val_data[column], errors='coerce')
 
-# 말투 생성 함수
-def generate_response(model, tokenizer, profile_gender, input_text, temperature=1.0, top_k=5):
-    input_seq = tokenizer.texts_to_sequences([input_text])
-    padded_input = pad_sequences(input_seq, maxlen=input_sequences.shape[1], padding='post')
+    # NaN 값을 0으로 대체 (또는 다른 값으로 대체)
+    train_data[column].fillna(0, inplace=True)
+    val_data[column].fillna(0, inplace=True)
 
-    # profile_gender를 모델의 입력에 추가
-    profile_input = np.array([[profile_gender]])
+    # 정수로 변환
+    train_data[column] = train_data[column].astype(int)
+    val_data[column] = val_data[column].astype(int)
 
-    # 모델을 사용하여 응답 생성
-    predicted_index = np.argmax(model.predict(padded_input), axis=-1)
-    predicted_text = tokenizer.index_word.get(predicted_index[0], "")
+    models[column].fit(train_padded[column], train_data[column].astype(int), epochs=5,
+                       validation_data=(val_padded[column], val_data[column].astype(int)))
 
-    return predicted_text
+# 5. 모델 평가
+for column in styles:
+    val_loss, val_acc = models[column].evaluate(val_padded[column], val_data[column].astype(int))
+    print(f'Validation Accuracy for {column}: {val_acc}')
 
-def calculate_similarity(model, tokenizer, text1, text2):
-    # 텍스트를 토큰화하여 시퀀스로 변환
-    seq1 = tokenizer.texts_to_sequences([text1])[0]
-    seq2 = tokenizer.texts_to_sequences([text2])[0]
+# 6. 문장 변환 함수
+def transform_sentence(input_text, tokenizers, models):
+    # 입력값 토큰화
+    input_sequences = tokenizers['formal'].texts_to_sequences([input_text])
+    input_padded = pad_sequences(input_sequences, maxlen=train_padded['formal'].shape[1])
 
-    # 패딩 적용
-    padded_seq1 = pad_sequences([seq1], maxlen=input_sequences.shape[1], padding='post')
-    padded_seq2 = pad_sequences([seq2], maxlen=input_sequences.shape[1], padding='post')
+    # 모델 예측
+    predictions = {}
+    for column in styles:
+        predictions[column] = models[column].predict(input_padded)
 
-    # 임베딩 추출
-    embedding1 = model.layers[1](padded_seq1)
-    embedding2 = model.layers[1](padded_seq2)
+    # 예측값을 가장 높은 확률을 가진 문체로 변환
+    predicted_style = max(predictions, key=predictions.get)
 
-    # 코사인 유사도 계산
-    similarity = cosine_similarity(embedding1.numpy(), embedding2.numpy())[0][0]
+    return predicted_style
 
-    return similarity
-
-# 가장 성능이 좋은 모델 로드
-best_model = load_model('best_model.h5')
-
-# 예시: 입력값에 대한 말투 생성
-input_text = "어제는 좋은 날이었어."
-profile_gender = 2  # 남성
-
-similarity_score = calculate_similarity(best_model, tokenizer, input_text1, input_text2)
-print(f"두 문장 간의 유사도: {similarity_score}")
-generated_response = generate_response(best_model, tokenizer, profile_gender, input_text)
-print(f"입력: {input_text}")
-print(f"변경된 응답: {generated_response}")
+# 모델 저장
+for column in styles:
+    models[column].save(f'{column}_model.h5')
